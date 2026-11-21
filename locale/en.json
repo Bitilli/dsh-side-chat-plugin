@@ -1,0 +1,7 @@
+{
+  "meta": {
+    "title": "Side chat",
+    "description": "Select transcript text to ask a follow-up in the main conversation or open an isolated side chat with a frozen parent-context snapshot and the exact quote.",
+    "detail": "docs/DETAIL.md"
+  }
+}

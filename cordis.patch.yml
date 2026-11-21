@@ -1,0 +1,7 @@
+# Insert the Side chat host plugin. The package's `dsh.client` entry adds the
+# browser half; the Host half owns persistence, context snapshots and the
+# authenticated `/api/side-chat/` Fetch route family.
+- insert:
+    - id: side-chat
+      name: dsh-side-chat-plugin
+      config: {}
