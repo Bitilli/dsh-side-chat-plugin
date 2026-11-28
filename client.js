@@ -1,11 +1,12 @@
 /**
  * Browser half of the Side chat plugin.
  *
- * Loaded through the DSH client module table, so React comes from the host and
- * no bundler is required. The module registers:
- *  - a selection bridge in the composer dock that renders the compact floating
- *    action bar (continue in main / ask in side);
- *  - a right-sidebar page type that lists and runs persisted side chats.
+ * The side chat is a native embedded Conversation for an ephemeral forked
+ * Session. This module only contributes:
+ *  - the compact selection bar (continue in main / ask in side, or quote in a
+ *    side Conversation);
+ *  - the `sidechat` resource provider that binds a child Session to the tab;
+ *  - the sidebar tab type that hosts the native Conversation.
  */
 window.__ModuleLoader__.load({
   id: 'dsh-side-chat-plugin',
@@ -13,20 +14,23 @@ window.__ModuleLoader__.load({
     const module = { exports: {} }
     const exports = module.exports
     const React = require('react')
-    const { createElement: h, useCallback, useEffect, useRef, useState } = React
     const { createPortal } = require('react-dom')
+    const { createElement: h, useCallback, useEffect, useRef, useState } = React
 
     const NS = 'sideChat'
     const API = '/api/side-chat'
-    const TAB_KIND = 'side-chat'
+    const KIND = 'sidechat'
     const TAB_ID = 'dsh-side-chat-plugin'
+    const ADDRESS_PREFIX = 'dsh-resource://sidechat/session/'
+    const purgingParents = new Set()
 
     const zh = {
       'tab.title': '侧边对话',
       'guide.title': '侧边对话',
-      'guide.description': '选中原文后继续追问，不修改主对话',
+      'guide.description': '在侧边与主对话同权限地追问，关闭即清除',
       'bar.continue': '在主对话继续问',
       'bar.side': '在侧边问',
+      'bar.sideQuote': '引用并追问',
       'bar.close': '关闭操作栏',
       'bar.busy': '正在创建侧边对话…',
       'bar.failed': '操作失败，请重试。',
@@ -34,40 +38,15 @@ window.__ModuleLoader__.load({
       'quote.detail': '选中片段',
       'quote.source': '引用自当前对话',
       'quote.current': '当前对话',
-      'panel.empty': '还没有侧边对话',
-      'panel.emptyHint': '在主对话中选中一段正文，然后选择“在侧边问”。',
-      'panel.placeholder': '在侧边继续追问…',
-      'panel.send': '发送',
-      'panel.stop': '停止',
-      'panel.retry': '重试',
-      'panel.close': '关闭侧边面板',
-      'panel.delete': '删除侧边对话',
-      'panel.confirmDelete': '确认删除',
-      'panel.backToMain': '带回主对话',
-      'panel.quote': '选中原文',
-      'panel.parent': '父对话',
-      'panel.snapshot': '父对话上下文快照',
-      'panel.snapshotMeta': '{count} 条消息 · 约 {tokens} tokens',
-      'panel.truncated': '已截断 {count} 条较早消息',
-      'panel.anchor': '锚点',
-      'panel.running': '正在回答…',
-      'panel.idle': '空闲',
-      'panel.error': '回答失败',
-      'panel.closed': '加载失败',
-      'panel.select': '切换侧边对话',
-      'panel.you': '你',
-      'panel.assistant': '侧边回答',
-      'panel.bringBackDone': '已插入主输入框',
-      'panel.copy': '复制',
-      'panel.copied': '已复制',
     }
 
     const en = {
       'tab.title': 'Side chat',
       'guide.title': 'Side chats',
-      'guide.description': 'Ask a follow-up without changing the main conversation',
+      'guide.description': 'Ask with the main chat permissions; closing clears it',
       'bar.continue': 'Continue in main',
       'bar.side': 'Ask in side',
+      'bar.sideQuote': 'Quote and ask',
       'bar.close': 'Dismiss actions',
       'bar.busy': 'Creating side chat…',
       'bar.failed': 'Action failed. Try again.',
@@ -75,37 +54,11 @@ window.__ModuleLoader__.load({
       'quote.detail': 'Selected excerpt',
       'quote.source': 'Quoted from this conversation',
       'quote.current': 'This conversation',
-      'panel.empty': 'No side chats yet',
-      'panel.emptyHint': 'Select transcript text, then choose “Ask in side”.',
-      'panel.placeholder': 'Ask a follow-up in this side chat…',
-      'panel.send': 'Send',
-      'panel.stop': 'Stop',
-      'panel.retry': 'Retry',
-      'panel.close': 'Close side panel',
-      'panel.delete': 'Delete side chat',
-      'panel.confirmDelete': 'Confirm delete',
-      'panel.backToMain': 'Bring back to main',
-      'panel.quote': 'Selected excerpt',
-      'panel.parent': 'Parent',
-      'panel.snapshot': 'Parent context snapshot',
-      'panel.snapshotMeta': '{count} messages · ~{tokens} tokens',
-      'panel.truncated': '{count} older messages truncated',
-      'panel.anchor': 'Anchor',
-      'panel.running': 'Answering…',
-      'panel.idle': 'Idle',
-      'panel.error': 'Answer failed',
-      'panel.closed': 'Failed to load',
-      'panel.select': 'Switch side chat',
-      'panel.you': 'You',
-      'panel.assistant': 'Side answer',
-      'panel.bringBackDone': 'Inserted into the main composer',
-      'panel.copy': 'Copy',
-      'panel.copied': 'Copied',
     }
 
     const css = `
       .dsc-bar{position:fixed;z-index:80;display:flex;flex-direction:column;gap:6px;align-items:stretch;
-        min-width:260px;max-width:min(360px,calc(100vw - 16px));padding:5px;border-radius:12px;
+        min-width:240px;max-width:min(360px,calc(100vw - 16px));padding:5px;border-radius:12px;
         background:var(--dsw-alias-bg-overlay);border:1px solid var(--dsw-alias-border-l2);
         box-shadow:var(--dsw-elevation-panel);color:var(--dsw-alias-label-primary);font:inherit}
       .dsc-barRow{display:flex;gap:4px;align-items:center}
@@ -119,53 +72,40 @@ window.__ModuleLoader__.load({
       .dsc-barHint{font-size:11px;color:var(--dsw-alias-label-secondary);padding:0 8px 2px}
       body[data-dsh-side-bar="1"] [data-text-interaction-surface]{display:none !important}
 
-      .dsc-panel{display:flex;flex-direction:column;height:100%;min-height:0;color:var(--dsw-alias-label-primary);font:inherit}
-      .dsc-head{display:flex;align-items:center;gap:6px;padding:10px 12px;border-bottom:1px solid var(--dsw-alias-border-l1);flex:none}
-      .dsc-title{font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0}
-      .dsc-status{font-size:11px;color:var(--dsw-alias-label-secondary);display:inline-flex;align-items:center;gap:4px;flex:none}
-      .dsc-dot{width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-state-idle-primary);display:inline-block}
-      .dsc-dot[data-running]{background:var(--dsw-alias-state-warn-primary)}
-      .dsc-dot[data-error]{background:var(--dsw-alias-state-error-primary)}
-      .dsc-iconButton{appearance:none;border:0;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;
-        font:inherit;font-size:14px;line-height:1;padding:5px 7px;border-radius:6px;flex:none}
-      .dsc-iconButton:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-      .dsc-iconButton:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-      .dsc-select{appearance:auto;max-width:150px;min-width:0;border:1px solid var(--dsw-alias-border-l1);
-        background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);border-radius:7px;
-        font:inherit;font-size:12px;padding:4px 6px;flex:none}
-      .dsc-scroll{flex:1;min-height:0;overflow:auto;padding:12px;display:flex;flex-direction:column;gap:12px}
-      .dsc-empty{margin:auto;text-align:center;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:1.6;padding:24px 12px}
-      .dsc-quote{border:1px solid var(--dsw-alias-border-l1);border-left:3px solid var(--dsw-alias-brand-primary);
-        background:var(--dsw-alias-bg-layer-1);border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.55}
-      .dsc-quoteText{white-space:pre-wrap;overflow-wrap:anywhere;max-height:120px;overflow:auto;color:var(--dsw-alias-label-primary)}
-      .dsc-meta{margin-top:5px;color:var(--dsw-alias-label-secondary);font-size:11px;line-height:1.5}
-      .dsc-message{display:flex;flex-direction:column;gap:5px}
-      .dsc-role{font-size:11px;color:var(--dsw-alias-label-secondary);display:flex;align-items:center;gap:6px}
-      .dsc-body{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6}
-      .dsc-message[data-role="user"] .dsc-body{background:var(--dsw-alias-bg-layer-2);border-radius:8px;padding:8px 10px}
-      .dsc-messageActions{display:flex;gap:4px;flex-wrap:wrap}
-      .dsc-mini{appearance:none;border:1px solid var(--dsw-alias-border-l1);background:transparent;color:var(--dsw-alias-label-secondary);
-        cursor:pointer;font:inherit;font-size:11px;padding:3px 7px;border-radius:6px}
-      .dsc-mini:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-      .dsc-mini:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}
-      .dsc-error{border:1px solid var(--dsw-alias-state-error-primary);background:var(--dsw-alias-bg-layer-1);
-        border-radius:8px;padding:8px 10px;font-size:12px;color:var(--dsw-alias-state-error-primary);display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-      .dsc-streaming{font-size:12px;color:var(--dsw-alias-label-secondary);display:flex;align-items:center;gap:6px}
-      .dsc-foot{flex:none;border-top:1px solid var(--dsw-alias-border-l1);padding:8px 10px 10px;display:flex;flex-direction:column;gap:6px}
-      .dsc-input{width:100%;box-sizing:border-box;resize:none;min-height:46px;max-height:140px;padding:8px 9px;
-        border:1px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-1);
-        color:var(--dsw-alias-label-primary);font:inherit;font-size:13px;line-height:1.5}
-      .dsc-input:focus{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-1px}
-      .dsc-footRow{display:flex;gap:6px;align-items:center;justify-content:flex-end}
-      .dsc-action{appearance:none;border:0;border-radius:7px;cursor:pointer;font:inherit;font-size:12px;padding:5px 10px;
-        background:var(--dsw-alias-brand-primary);color:var(--dsw-alias-bg-base)}
-      .dsc-action[data-secondary]{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}
-      .dsc-action:disabled{opacity:.5;cursor:default}
-      .dsc-action:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}
-      .dsc-note{font-size:11px;color:var(--dsw-alias-label-secondary)}
+      .dsc-native{display:flex;flex-direction:column;height:100%;min-height:0}
     `
 
-    async function apiJson(path, { method = 'GET', body, signal } = {}) {
+    function parseAddress(value) {
+      let url
+      try {
+        url = new URL(value)
+      } catch {
+        return undefined
+      }
+      if (url.protocol !== 'dsh-resource:' || url.hostname.toLowerCase() !== 'sidechat') return undefined
+      const parts = url.pathname.split('/').filter(Boolean)
+      if (parts.length !== 2 || parts[0] !== 'session') return undefined
+      const parentSessionId = url.searchParams.get('parent')
+      if (parentSessionId === null || parentSessionId === '') return undefined
+      try {
+        const childSessionId = decodeURIComponent(parts[1])
+        if (childSessionId === '') return undefined
+        return {
+          childSessionId,
+          parentSessionId,
+          title: url.searchParams.get('title') ?? '',
+        }
+      } catch {
+        return undefined
+      }
+    }
+
+    function addressOf(childSessionId, parentSessionId, title) {
+      const query = new URLSearchParams({ parent: parentSessionId, title: title ?? '' })
+      return `${ADDRESS_PREFIX}${encodeURIComponent(childSessionId)}?${query.toString()}`
+    }
+
+    async function apiJson(path, { method = 'GET', body } = {}) {
       const response = await fetch(`${API}${path}`, {
         method,
         credentials: 'same-origin',
@@ -173,7 +113,6 @@ window.__ModuleLoader__.load({
           ...(body === undefined ? {} : { 'content-type': 'application/json' }),
         },
         body: body === undefined ? undefined : JSON.stringify(body),
-        signal,
       })
       let payload = {}
       try {
@@ -190,72 +129,6 @@ window.__ModuleLoader__.load({
       return payload
     }
 
-    function dispatchSse(block, onEvent) {
-      const data = block
-        .split(/\r?\n/u)
-        .filter(line => line.startsWith('data:'))
-        .map(line => line.slice(5).trimStart())
-        .join('\n')
-      if (data === '') return
-      try {
-        onEvent(JSON.parse(data))
-      } catch {
-        // A malformed frame is ignored; the next done/error frame still settles the view.
-      }
-    }
-
-    /**
-     * Open one SSE request. Resolves after response headers; frames keep arriving
-     * through `onEvent`. The returned controller aborts the client reader only.
-     */
-    async function openStream(path, body, onEvent) {
-      const controller = new AbortController()
-      const response = await fetch(`${API}${path}`, {
-        method: 'POST',
-        credentials: 'same-origin',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      })
-      if (!response.ok) {
-        let payload = {}
-        try {
-          payload = await response.json()
-        } catch {
-          payload = {}
-        }
-        const error = new Error(payload.message ?? `HTTP ${response.status}`)
-        error.code = payload.code
-        error.status = response.status
-        throw error
-      }
-      if (response.body === null) throw new Error('stream unavailable')
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      ;(async () => {
-        try {
-          for (;;) {
-            const { done, value } = await reader.read()
-            if (done) break
-            buffer += decoder.decode(value, { stream: true })
-            let index = buffer.indexOf('\n\n')
-            while (index >= 0) {
-              dispatchSse(buffer.slice(0, index), onEvent)
-              buffer = buffer.slice(index + 2)
-              index = buffer.indexOf('\n\n')
-            }
-          }
-          if (buffer.trim() !== '') dispatchSse(buffer, onEvent)
-        } catch (error) {
-          if (error?.name !== 'AbortError') {
-            onEvent({ type: 'client-error', error: { message: error?.message ?? String(error) } })
-          }
-        }
-      })()
-      return controller
-    }
-
     function elementOf(node) {
       return node?.nodeType === Node.ELEMENT_NODE ? node : node?.parentElement ?? null
     }
@@ -264,7 +137,6 @@ window.__ModuleLoader__.load({
       return node instanceof Element && node.closest('[data-dsh-side-bar]') !== null
     }
 
-    /** Read the browser selection and map it to one rendered interaction source. */
     function readSelection() {
       const selection = document.getSelection()
       if (selection === null || selection.rangeCount !== 1 || selection.isCollapsed) return null
@@ -311,7 +183,6 @@ window.__ModuleLoader__.load({
         endOffset,
         blockId: node?.getAttribute('data-chat-node-key') ?? undefined,
         rect: { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom },
-        source,
         range: range.cloneRange(),
       }
     }
@@ -331,16 +202,18 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Compact floating action bar surfaced for a transcript selection. */
+    /** Selection bar for the main or an embedded side Conversation. */
     function SelectionBridge({ hostCtx, sessionId, inputActions, t }) {
       const [bar, setBar] = useState(null)
       const [busy, setBusy] = useState(false)
       const [failure, setFailure] = useState('')
       const barRef = useRef(null)
+      const markerRef = useRef(null)
       const firstButtonRef = useRef(null)
       const keyboardRef = useRef(false)
       const frameRef = useRef(0)
       const infoRef = useRef(null)
+      const sideRef = useRef(false)
 
       const close = useCallback(() => {
         infoRef.current = null
@@ -359,8 +232,9 @@ window.__ModuleLoader__.load({
           return
         }
         infoRef.current = info
+        sideRef.current = markerRef.current?.closest('[data-side-chat-session]') !== null
         const placement = barPlacement(info.rect)
-        setBar({ ...info, ...placement })
+        setBar({ ...info, ...placement, inSide: sideRef.current })
         document.body.setAttribute('data-dsh-side-bar', '1')
         if (keyboardRef.current) {
           requestAnimationFrame(() => firstButtonRef.current?.focus({ preventScroll: true }))
@@ -375,6 +249,75 @@ window.__ModuleLoader__.load({
           update()
         })
       }, [update])
+
+      const clearSelection = () => {
+        document.getSelection()?.removeAllRanges()
+      }
+
+      const insertQuote = () => {
+        const info = infoRef.current
+        if (info === null || busy) return
+        const summary = {
+          label: t('quote.label'),
+          title: sideRef.current ? t('tab.title') : t('quote.current'),
+          detail: t('quote.detail'),
+          body: info.text,
+        }
+        if (!(inputActions?.insertQuote(info.text, summary) ?? false)) {
+          setFailure(t('bar.failed'))
+          return
+        }
+        clearSelection()
+        close()
+      }
+
+      const actMain = () => {
+        const info = infoRef.current
+        if (info === null || busy) return
+        const sent = `${info.text}\n\n${t('quote.source')}`
+        const summary = {
+          label: t('quote.label'),
+          title: t('quote.current'),
+          detail: t('quote.detail'),
+          body: sent,
+        }
+        if (!(inputActions?.insertQuote(sent, summary) ?? false)) {
+          setFailure(t('bar.failed'))
+          return
+        }
+        clearSelection()
+        close()
+      }
+
+      const actSide = async () => {
+        const info = infoRef.current
+        if (info === null || busy) return
+        setBusy(true)
+        setFailure('')
+        try {
+          const payload = {
+            parentSessionId: sessionId,
+            anchorMessageId: undefined,
+            quote: {
+              exact: info.text,
+              prefix: info.prefix,
+              suffix: info.suffix,
+              startOffset: info.startOffset,
+              endOffset: info.endOffset,
+              blockId: info.blockId,
+            },
+          }
+          const result = await apiJson('/create', { method: 'POST', body: payload })
+          if (typeof result.sessionId !== 'string') throw new Error('missing side-chat session id')
+          const address = result.address ?? addressOf(result.sessionId, sessionId, result.title)
+          hostCtx.sidebarRight.openResource(address)
+          clearSelection()
+          close()
+        } catch (error) {
+          setFailure(error?.message ?? t('bar.failed'))
+          setBusy(false)
+        }
+      }
 
       useEffect(() => {
         const onPointerDown = (event) => {
@@ -394,8 +337,9 @@ window.__ModuleLoader__.load({
           if (infoRef.current === null || event.altKey === false) return
           if (event.key.toLowerCase() === 'q') {
             event.preventDefault()
-            void actMain()
-          } else if (event.key.toLowerCase() === 's') {
+            if (sideRef.current) insertQuote()
+            else actMain()
+          } else if (event.key.toLowerCase() === 's' && !sideRef.current) {
             event.preventDefault()
             void actSide()
           }
@@ -439,473 +383,164 @@ window.__ModuleLoader__.load({
         }
       }, [close, schedule, busy])
 
-      const clearSelection = () => {
-        document.getSelection()?.removeAllRanges()
-      }
-
-      const actMain = async () => {
-        const info = infoRef.current
-        if (info === null || busy) return
-        const text = info.text
-        const sent = `${text}\n\n${t('quote.source')}`
-        const summary = {
-          label: t('quote.label'),
-          title: t('quote.current'),
-          detail: t('quote.detail'),
-          body: sent,
-        }
-        const inserted = inputActions?.insertQuote(sent, summary) ?? false
-        if (!inserted) {
-          setFailure(t('bar.failed'))
-          return
-        }
-        clearSelection()
-        close()
-      }
-
-      const actSide = async () => {
-        const info = infoRef.current
-        if (info === null || busy) return
-        setBusy(true)
-        setFailure('')
-        try {
-          const payload = {
-            parentSessionId: sessionId,
-            anchorMessageId: undefined,
-            quote: {
-              exact: info.text,
-              prefix: info.prefix,
-              suffix: info.suffix,
-              startOffset: info.startOffset,
-              endOffset: info.endOffset,
-              blockId: info.blockId,
-            },
-          }
-          const result = await apiJson('/create', { method: 'POST', body: payload })
-          const sideChatId = result?.chat?.id
-          if (typeof sideChatId !== 'string') throw new Error('missing side chat id')
-          const sidebar = hostCtx?.sidebarRight
-          if (sidebar === undefined) throw new Error('right sidebar unavailable')
-          sidebar.openTab(TAB_KIND, { params: { sideChatId } })
-          clearSelection()
-          close()
-        } catch (error) {
-          setFailure(error?.message ?? t('bar.failed'))
-          setBusy(false)
-        }
-      }
-
-      if (bar === null) return null
-      return createPortal(
-        h('div', {
-          ref: barRef,
-          className: 'dsc-bar',
-          role: 'toolbar',
-          'aria-label': t('bar.continue'),
-          'data-dsh-side-bar': '',
-          style: { left: `${bar.left}px`, top: `${bar.top}px`, transform: bar.transform },
-          onPointerDown: event => event.preventDefault(),
-        },
-          h('div', { className: 'dsc-barRow' },
-            h('button', {
-              ref: firstButtonRef,
-              type: 'button',
-              className: 'dsc-barButton',
-              'data-primary': '',
-              'aria-keyshortcuts': 'Alt+Q',
-              onPointerDown: event => event.preventDefault(),
-              onClick: () => { void actMain() },
-            }, `↩ ${t('bar.continue')}`),
-            h('button', {
-              type: 'button',
-              className: 'dsc-barButton',
-              'aria-keyshortcuts': 'Alt+S',
-              onPointerDown: event => event.preventDefault(),
-              onClick: () => { void actSide() },
-            }, `◧ ${t('bar.side')}`),
-            h('button', {
-              type: 'button',
-              className: 'dsc-barButton dsc-barClose',
-              'aria-label': t('bar.close'),
-              title: t('bar.close'),
-              onPointerDown: event => event.preventDefault(),
-              onClick: close,
-            }, '×'),
-          ),
-          busy ? h('div', { className: 'dsc-barHint' }, t('bar.busy')) : null,
-          failure === '' ? null : h('div', { className: 'dsc-barError', role: 'alert' }, failure),
-          h('div', { className: 'dsc-barHint' }, 'Alt+Q / Alt+S · Esc'),
-        ),
-        document.body,
-      )
-    }
-
-    function statusLabel(status, t) {
-      if (status === 'running') return t('panel.running')
-      if (status === 'error') return t('panel.error')
-      return t('panel.idle')
-    }
-
-    function SideChatPanel({ hostCtx, sessionId, useTabInfo, inputActions, t }) {
-      const { tab } = useTabInfo()
-      const params = tab?.navigation?.params ?? {}
-      const [chats, setChats] = useState([])
-      const [activeId, setActiveId] = useState(typeof params.sideChatId === 'string' ? params.sideChatId : null)
-      const [detail, setDetail] = useState(null)
-      const [draft, setDraft] = useState('')
-      const [error, setError] = useState('')
-      const [notice, setNotice] = useState('')
-      const [loading, setLoading] = useState(true)
-      const [running, setRunning] = useState(false)
-      const [streamText, setStreamText] = useState('')
-      const [unread, setUnread] = useState(() => new Set())
-      const [confirmDelete, setConfirmDelete] = useState(false)
-      const activeIdRef = useRef(activeId)
-      const streamsRef = useRef(new Map())
-      const streamTextRef = useRef('')
-      const mountedRef = useRef(true)
-      const scrollRef = useRef(null)
-      const textareaRef = useRef(null)
-      const deleteTimerRef = useRef(null)
-
-      useEffect(() => {
-        activeIdRef.current = activeId
-      }, [activeId])
-
-      useEffect(() => () => {
-        mountedRef.current = false
-        if (deleteTimerRef.current !== null) clearTimeout(deleteTimerRef.current)
-        for (const entry of streamsRef.current.values()) entry.controller?.abort()
-      }, [])
-
-      const refreshList = useCallback(async () => {
-        try {
-          const payload = await apiJson(`/list?parentSessionId=${encodeURIComponent(sessionId)}`)
-          if (!mountedRef.current) return
-          const next = Array.isArray(payload.chats) ? payload.chats : []
-          setChats(next)
-          setActiveId(current => {
-            if (current !== null && next.some(chat => chat.id === current)) return current
-            if (typeof params.sideChatId === 'string' && next.some(chat => chat.id === params.sideChatId)) return params.sideChatId
-            const stored = window.localStorage.getItem(`dsh.side-chat.active.${sessionId}`)
-            if (stored !== null && next.some(chat => chat.id === stored)) return stored
-            return next.length === 0 ? null : next[0].id
-          })
-        } catch (failure) {
-          if (mountedRef.current) setError(failure?.message ?? t('panel.closed'))
-        } finally {
-          if (mountedRef.current) setLoading(false)
-        }
-      }, [sessionId, params.sideChatId, t])
-
-      const loadDetail = useCallback(async (id) => {
-        if (id === null) {
-          setDetail(null)
-          return
-        }
-        try {
-          const payload = await apiJson(`/get?id=${encodeURIComponent(id)}&parentSessionId=${encodeURIComponent(sessionId)}`)
-          if (!mountedRef.current) return
-          setDetail(payload.chat)
-          setRunning(payload.chat?.status === 'running')
-          setError('')
-        } catch (failure) {
-          if (mountedRef.current) setError(failure?.message ?? t('panel.closed'))
-        }
-      }, [sessionId, t])
-
-      useEffect(() => {
-        void refreshList()
-      }, [refreshList])
-
-      useEffect(() => {
-        if (typeof params.sideChatId === 'string' && params.sideChatId !== activeIdRef.current) {
-          setActiveId(params.sideChatId)
-        }
-      }, [params.sideChatId, tab?.navigation?.revision])
-
-      useEffect(() => {
-        if (activeId === null) {
-          setDetail(null)
-          return
-        }
-        window.localStorage.setItem(`dsh.side-chat.active.${sessionId}`, activeId)
-        setUnread(current => {
-          if (!current.has(activeId)) return current
-          const next = new Set(current)
-          next.delete(activeId)
-          return next
-        })
-        void loadDetail(activeId)
-      }, [activeId, sessionId, loadDetail])
-
-      useEffect(() => {
-        if (!running || activeId === null) return
-        const timer = setInterval(() => { void loadDetail(activeId) }, 1200)
-        return () => clearInterval(timer)
-      }, [running, activeId, loadDetail])
-
-      useEffect(() => {
-        const element = scrollRef.current
-        if (element !== null) element.scrollTop = element.scrollHeight
-      }, [detail?.messages?.length, streamText, activeId])
-
-      const selectChat = (id) => {
-        setActiveId(id)
-        setConfirmDelete(false)
-        hostCtx.sidebarRight.openTab(TAB_KIND, { params: { sideChatId: id } })
-      }
-
-      const updateChat = (next) => {
-        if (next === null) return
-        setChats(current => current.map(chat => chat.id === next.id
-          ? { ...chat, status: next.status, title: next.title, updatedAt: next.updatedAt, error: next.error }
-          : chat))
-      }
-
-      const handleEvent = (id, event) => {
-        if (!mountedRef.current || event === null) return
-        if (event.type === 'start') {
-          setRunning(true)
-          if (id === activeIdRef.current) {
-            setStreamText('')
-            streamTextRef.current = ''
-          }
-          return
-        }
-        if (event.type === 'delta') {
-          if (id === activeIdRef.current && typeof event.text === 'string') {
-            streamTextRef.current += event.text
-            setStreamText(streamTextRef.current)
-          }
-          return
-        }
-        if (event.type === 'reasoning') return
-        if (event.type === 'done') {
-          setRunning(false)
-          if (id === activeIdRef.current) {
-            setStreamText('')
-            streamTextRef.current = ''
-            setDetail(event.chat ?? null)
-            setError('')
-          } else if (event.cancelled !== true) {
-            setUnread(current => new Set(current).add(id))
-          }
-          if (event.chat !== undefined) updateChat(event.chat)
-          void refreshList()
-          return
-        }
-        if (event.type === 'error') {
-          setRunning(false)
-          setError(event.error?.message ?? t('panel.error'))
-          if (id === activeIdRef.current && event.chat !== undefined) setDetail(event.chat)
-          if (event.chat !== undefined) updateChat(event.chat)
-          void refreshList()
-          return
-        }
-        if (event.type === 'client-error') {
-          setRunning(false)
-          setError(event.error?.message ?? t('panel.error'))
-        }
-      }
-
-      const beginStream = async (path, body) => {
-        setError('')
-        setNotice('')
-        setRunning(true)
-        setStreamText('')
-        streamTextRef.current = ''
-        try {
-          const controller = await openStream(path, body, event => handleEvent(body.id, event))
-          streamsRef.current.set(body.id, { controller })
-        } catch (failure) {
-          setRunning(false)
-          setError(failure?.message ?? t('panel.error'))
-          if (body.id === activeIdRef.current) void loadDetail(body.id)
-        }
-      }
-
-      const send = () => {
-        const text = draft.trim()
-        if (text === '' || activeId === null || running) return
-        setDraft('')
-        setDetail(current => current === null ? current : {
-          ...current,
-          messages: [
-            ...(current.messages ?? []),
-            { id: `local-user-${Date.now()}`, role: 'user', content: [{ type: 'text', text }], status: 'done', createdAt: new Date().toISOString() },
-            { id: `local-assistant-${Date.now()}`, role: 'assistant', content: [{ type: 'text', text: '' }], status: 'streaming', createdAt: new Date().toISOString() },
-          ],
-        })
-        void beginStream('/turn', { id: activeId, parentSessionId: sessionId, text })
-      }
-
-      const stop = async () => {
-        if (activeId === null) return
-        try {
-          await apiJson('/cancel', { method: 'POST', body: { id: activeId, parentSessionId: sessionId } })
-        } catch (failure) {
-          setError(failure?.message ?? t('panel.error'))
-        }
-        const entry = streamsRef.current.get(activeId)
-        entry?.controller?.abort()
-        streamsRef.current.delete(activeId)
-        setRunning(false)
-        setStreamText('')
-        streamTextRef.current = ''
-        setTimeout(() => { void loadDetail(activeId) }, 250)
-      }
-
-      const retry = () => {
-        if (activeId === null || running) return
-        setDetail(current => {
-          if (current === null) return current
-          const messages = [...(current.messages ?? [])]
-          const last = messages[messages.length - 1]
-          if (last?.role === 'assistant' && (last.status === 'error' || last.status === 'cancelled')) messages.pop()
-          return { ...current, messages, status: 'running', error: null }
-        })
-        void beginStream('/retry', { id: activeId, parentSessionId: sessionId })
-      }
-
-      const bringBack = (text) => {
-        if (typeof text !== 'string' || text.trim() === '') return
-        const inserted = inputActions?.insertQuote(text, {
-          label: t('quote.label'),
-          title: detail?.title ?? t('tab.title'),
-          detail: t('quote.detail'),
-          body: text,
-        }) ?? false
-        setNotice(inserted ? t('panel.bringBackDone') : t('panel.error'))
-        if (inserted) setTimeout(() => setNotice(''), 2500)
-      }
-
-      const deleteChat = async () => {
-        if (activeId === null) return
-        if (!confirmDelete) {
-          setConfirmDelete(true)
-          deleteTimerRef.current = setTimeout(() => setConfirmDelete(false), 3000)
-          return
-        }
-        setConfirmDelete(false)
-        try {
-          await apiJson('/delete', { method: 'POST', body: { id: activeId, parentSessionId: sessionId } })
-          const removed = activeId
-          setDetail(null)
-          setActiveId(null)
-          setChats(current => current.filter(chat => chat.id !== removed))
-          await refreshList()
-        } catch (failure) {
-          setError(failure?.message ?? t('panel.error'))
-        }
-      }
-
-      const activeSummary = chats.find(chat => chat.id === activeId)
-      const current = detail?.id === activeId ? detail : null
-      const messages = Array.isArray(current?.messages) ? current.messages : []
-      const lastAssistant = [...messages].reverse().find(message => message.role === 'assistant')
-      const canRetry = lastAssistant !== undefined && (lastAssistant.status === 'error' || lastAssistant.status === 'cancelled')
-      const showingStream = running && activeId !== null
-
-      return h('div', { className: 'dsc-panel' },
-        h('div', { className: 'dsc-head' },
-          h('span', { className: 'dsc-dot', 'data-running': running ? '' : undefined, 'data-error': current?.status === 'error' ? '' : undefined }),
-          h('span', { className: 'dsc-title', title: activeSummary?.title ?? t('tab.title') }, t('tab.title')),
-          chats.length > 1 ? h('select', {
-            className: 'dsc-select',
-            value: activeId ?? '',
-            'aria-label': t('panel.select'),
-            onChange: event => selectChat(event.target.value),
-          }, chats.map(chat => h('option', { key: chat.id, value: chat.id },
-            `${unread.has(chat.id) ? '• ' : ''}${chat.title}`))) : null,
-          h('button', {
-            type: 'button',
-            className: 'dsc-iconButton',
-            title: t('panel.close'),
-            'aria-label': t('panel.close'),
-            onClick: () => tab?.actions?.close?.(),
-          }, '×'),
-        ),
-        h('div', { className: 'dsc-scroll', ref: scrollRef },
-          activeId === null
-            ? h('div', { className: 'dsc-empty' },
-              h('div', null, t('panel.empty')),
-              h('div', null, t('panel.emptyHint')))
-            : null,
-          current === null ? null : h(React.Fragment, null,
-            h('div', { className: 'dsc-quote' },
-              h('div', { className: 'dsc-quoteText' }, current.quoteRef?.exact ?? ''),
-              h('div', { className: 'dsc-meta' },
-                h('div', null, `${t('panel.quote')} · ${t('panel.parent')}: ${current.parentTitle ?? '—'} · ${t('panel.anchor')}: ${(current.anchorMessageId || '—').slice(0, 12)}`),
-                h('div', null, `${t('panel.snapshot')}: ${t('panel.snapshotMeta').replace('{count}', String(current.contextSnapshot?.messageCount ?? 0)).replace('{tokens}', String(current.contextSnapshot?.estimatedTokens ?? 0))}`),
-                current.contextSnapshot?.truncatedCount > 0
-                  ? h('div', null, t('panel.truncated').replace('{count}', String(current.contextSnapshot.truncatedCount)))
-                  : null)),
-            messages.map(message => h('div', { key: message.id, className: 'dsc-message', 'data-role': message.role },
-              h('div', { className: 'dsc-role' }, message.role === 'assistant' ? t('panel.assistant') : t('panel.you')),
-              h('div', { className: 'dsc-body' }, message.role === 'assistant'
-                ? (message.content?.[0]?.text ?? '')
-                : (message.content?.[0]?.text ?? '')),
-              message.role === 'assistant' && (message.content?.[0]?.text ?? '') !== ''
-                ? h('div', { className: 'dsc-messageActions' },
-                  h('button', {
-                    type: 'button', className: 'dsc-mini',
-                    onClick: () => bringBack(message.content?.[0]?.text ?? ''),
-                  }, t('panel.backToMain')))
-                : null)),
-            showingStream
-              ? h('div', { className: 'dsc-message', 'data-role': 'assistant' },
-                h('div', { className: 'dsc-role' }, t('panel.assistant')),
-                h('div', { className: 'dsc-streaming' }, h('span', { className: 'dsc-dot', 'data-running': '' }), t('panel.running')),
-                streamText === '' ? null : h('div', { className: 'dsc-body' }, streamText))
-              : null,
-            canRetry && !running && error === ''
-              ? h('div', { className: 'dsc-messageActions' },
-                h('button', { type: 'button', className: 'dsc-mini', onClick: retry }, t('panel.retry')))
-              : null,
-            error !== ''
-              ? h('div', { className: 'dsc-error', role: 'alert' },
-                h('span', null, error),
-                canRetry ? h('button', { type: 'button', className: 'dsc-mini', onClick: retry }, t('panel.retry')) : null)
-              : null,
-            notice !== '' ? h('div', { className: 'dsc-note', role: 'status' }, notice) : null,
-          ),
-        ),
-        h('div', { className: 'dsc-foot' },
-          h('textarea', {
-            ref: textareaRef,
-            className: 'dsc-input',
-            value: draft,
-            placeholder: t('panel.placeholder'),
-            'aria-label': t('panel.placeholder'),
-            disabled: activeId === null || running,
-            onChange: event => setDraft(event.target.value),
-            onKeyDown: event => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent?.isComposing) {
-                event.preventDefault()
-                send()
-              }
-            },
-          }),
-          h('div', { className: 'dsc-footRow' },
-            chats.length > 1 ? h('button', {
-              type: 'button',
-              className: 'dsc-mini',
-              onClick: () => { void deleteChat() },
-            }, confirmDelete ? t('panel.confirmDelete') : t('panel.delete')) : null,
-            h('span', { className: 'dsc-note', style: { marginRight: 'auto' } },
-              current === null ? '' : statusLabel(current.status, t)),
-            running
-              ? h('button', { type: 'button', className: 'dsc-action', 'data-secondary': '', onClick: () => { void stop() } }, t('panel.stop'))
-              : h('button', {
+      const marker = h('span', {
+        ref: markerRef,
+        hidden: true,
+        'data-dsh-side-bridge': '',
+        'aria-hidden': 'true',
+      })
+      if (bar === null) return marker
+      return h(React.Fragment, null,
+        marker,
+        createPortal(
+          h('div', {
+            ref: barRef,
+            className: 'dsc-bar',
+            role: 'toolbar',
+            'aria-label': bar.inSide ? t('bar.sideQuote') : t('bar.continue'),
+            'data-dsh-side-bar': '',
+            style: { left: `${bar.left}px`, top: `${bar.top}px`, transform: bar.transform },
+            onPointerDown: event => event.preventDefault(),
+          },
+            h('div', { className: 'dsc-barRow' },
+              h('button', {
+                ref: firstButtonRef,
                 type: 'button',
-                className: 'dsc-action',
-                disabled: activeId === null || draft.trim() === '',
-                onClick: send,
-              }, t('panel.send')),
+                className: 'dsc-barButton',
+                'data-primary': '',
+                'aria-keyshortcuts': 'Alt+Q',
+                onPointerDown: event => event.preventDefault(),
+                onClick: bar.inSide ? insertQuote : actMain,
+              }, bar.inSide ? `❝ ${t('bar.sideQuote')}` : `↩ ${t('bar.continue')}`),
+              bar.inSide ? null : h('button', {
+                type: 'button',
+                className: 'dsc-barButton',
+                'aria-keyshortcuts': 'Alt+S',
+                onPointerDown: event => event.preventDefault(),
+                onClick: () => { void actSide() },
+              }, `◧ ${t('bar.side')}`),
+              h('button', {
+                type: 'button',
+                className: 'dsc-barButton dsc-barClose',
+                'aria-label': t('bar.close'),
+                title: t('bar.close'),
+                onPointerDown: event => event.preventDefault(),
+                onClick: close,
+              }, '×'),
+            ),
+            busy ? h('div', { className: 'dsc-barHint' }, t('bar.busy')) : null,
+            failure === '' ? null : h('div', { className: 'dsc-barError', role: 'alert' }, failure),
+            h('div', { className: 'dsc-barHint' }, bar.inSide ? 'Alt+Q · Esc' : 'Alt+Q / Alt+S · Esc'),
           ),
+          document.body,
         ),
       )
+    }
+
+    /** Native Conversation body for one side-chat Session resource. */
+    function SideChatTab({ hostCtx, sessionId, useTabInfo, useResource, SessionProvider, renderSlot, renderFactorySlot, t }) {
+      const { tab, sidebar } = useTabInfo()
+      const parsed = parseAddress(tab.contentId)
+      const resource = useResource(tab.contentId)
+      const purged = useRef(false)
+      const wasExpanded = useRef(sidebar.expanded)
+      const parentId = parsed?.parentSessionId ?? sessionId
+
+      useEffect(() => {
+        if (wasExpanded.current && !sidebar.expanded && !purged.current) {
+          purged.current = true
+          void purgeParent(hostCtx, parentId)
+        }
+        wasExpanded.current = sidebar.expanded
+      }, [hostCtx, parentId, sidebar.expanded])
+
+      useEffect(() => {
+        if (resource.status !== 'failed' || tab.actions?.close === undefined) return
+        // A tab restored after the Host purged its ephemeral Session has no
+        // resource; close the dead tab instead of showing an empty pane.
+        const timer = setTimeout(() => { tab.actions.close() }, 100)
+        return () => clearTimeout(timer)
+      }, [resource.status, tab])
+
+      if (resource.value === undefined) {
+        return h('div', { className: 'dsc-native', 'data-side-chat-session': parsed?.childSessionId ?? '' })
+      }
+      return h('div', {
+        className: 'dsc-native',
+        'data-side-chat-session': parsed?.childSessionId ?? resource.value.childSessionId,
+      },
+        h(SessionProvider, { session: resource.value.reference },
+          h(NativeConversation, { renderFactorySlot, renderSlot })),
+      )
+    }
+
+    /** Render the shared Conversation under the child SessionProvider. */
+    function NativeConversation({ renderFactorySlot, renderSlot }) {
+      if (renderFactorySlot !== undefined) {
+        return renderFactorySlot('conversation.content', { variant: 'embedded', phase: 'active', hero: false }, {
+          slots: { views: FixedChatConversationView },
+        })
+      }
+      return renderSlot('sidebar.chat.conversation', {})
+    }
+
+    /** Fixed Chat selection used by the embedded Conversation occurrence. */
+    function FixedChatConversationView(props) {
+      return h(React.Fragment, null, props.renderSlot('conversation.session', { view: 'chat' }))
+    }
+
+    async function purgeParent(hostCtx, parentSessionId) {
+      if (purgingParents.has(parentSessionId)) return
+      purgingParents.add(parentSessionId)
+      try {
+        await apiJson('/purge', { method: 'POST', body: { parentSessionId } })
+        const tabs = hostCtx.sidebarRight.openTabs.getSnapshot()
+          .filter(tab => tab.kind === KIND && tab.sessionId === parentSessionId)
+        for (const tab of tabs) {
+          try {
+            hostCtx.sidebarRight.close(tab.tabId)
+          } catch {
+            // The tab may already be closing.
+          }
+        }
+      } catch (error) {
+        console.error('[side-chat] purge failed', error)
+      } finally {
+        setTimeout(() => purgingParents.delete(parentSessionId), 500)
+      }
+    }
+
+    function waitForAbort(signal) {
+      if (signal.aborted) return Promise.resolve()
+      return new Promise((resolve) => {
+        signal.addEventListener('abort', () => resolve(), { once: true })
+      })
+    }
+
+    function sideChatResource(sessions) {
+      return {
+        protocol: 'sidechat',
+        async *open(resourceAddress, { signal }) {
+          const parsed = parseAddress(resourceAddress)
+          if (parsed === undefined) throw new Error(`side-chat: invalid address "${resourceAddress}"`)
+          if (signal.aborted) return
+          const reference = sessions.retain(parsed.childSessionId, { source: 'sidebarChat', signal })
+          try {
+            yield {
+              ok: true,
+              value: {
+                childSessionId: parsed.childSessionId,
+                parentSessionId: parsed.parentSessionId,
+                title: parsed.title,
+                reference,
+              },
+            }
+            await waitForAbort(signal)
+          } finally {
+            reference.release()
+          }
+        },
+      }
     }
 
     function apply(ctx) {
@@ -921,38 +556,56 @@ window.__ModuleLoader__.load({
         return () => tag.remove()
       }, 'side-chat: styles')
 
-      // The selection bridge lives in the composer dock because that slot is
-      // session-scoped and already carries `inputActions` for the parent
-      // conversation. It renders through a portal so it can sit at the
-      // selection without changing the composer layout.
+      // Keep the main-composer selection bar for both the main chat and an
+      // embedded side Conversation; the side variant only quotes into the side
+      // composer and never nests another side chat.
       ctx.slots.inject('conversation.composer.dock', () => ctx.slots.register({
         name: 'conversation.composer.dock',
         id: 'side-chat-selection',
         locale: NS,
       }, props => h(SelectionBridge, { ...props, hostCtx: ctx })))
 
-      const boundPanel = props => h(SideChatPanel, { ...props, hostCtx: ctx })
+      ctx.effect(() => ctx.resources.register(sideChatResource(ctx.sessions)), 'side-chat: resource provider')
+
       ctx.effect(() => ctx.sidebarRightTabs.register({
         id: TAB_ID,
-        kind: TAB_KIND,
+        kind: KIND,
+        patterns: [`${ADDRESS_PREFIX}**`],
+        priority: 'extension',
         keepMounted: true,
-        title: () => t('tab.title'),
-        guide: [{
-          id: 'side-chats',
-          title: () => t('guide.title'),
-          description: () => t('guide.description'),
-          order: 20,
-        }],
+        canOpen: address => parseAddress(address) !== undefined,
+        title: address => {
+          const parsed = parseAddress(address)
+          return parsed !== undefined && parsed.title !== '' ? parsed.title : t('tab.title')
+        },
       }), 'side-chat: sidebar tab type')
+
+      ctx.effect(() => ctx.sidebarRight.registerCloseHandler(KIND, (parentSessionId, tab) => {
+        if (purgingParents.has(parentSessionId)) return
+        const siblings = ctx.sidebarRight.openTabs.getSnapshot()
+          .filter(candidate => candidate.kind === KIND && candidate.sessionId === parentSessionId)
+        if (siblings.length <= 1) {
+          void purgeParent(ctx, parentSessionId)
+          return
+        }
+        const parsed = parseAddress(tab.contentId)
+        if (parsed === undefined) return
+        void apiJson('/delete', {
+          method: 'POST',
+          body: { sessionId: parsed.childSessionId, parentSessionId },
+        }).catch(error => console.error('[side-chat] delete failed', error))
+      }), 'side-chat: close handler')
+
       ctx.slots.inject('sidebar.right.pane.tab', () => ctx.slots.register({
         name: 'sidebar.right.pane.tab',
         key: TAB_ID,
         locale: NS,
-      }, boundPanel))
+        children: { 'sidebar.chat.conversation': { kind: 'single', scope: 'session' } },
+      }, props => h(SideChatTab, { ...props, hostCtx: ctx })))
     }
 
     exports.name = 'side-chat'
-    exports.inject = ['slots', 'locale', 'sessions', 'uiConversation', 'sidebarRight', 'sidebarRightTabs']
+    exports.inject = ['slots', 'locale', 'sessions', 'sidebarRight', 'sidebarRightTabs', 'resources']
     exports.apply = apply
     return module.exports
   },

@@ -1,22 +1,22 @@
 /**
  * Host half of the Side chat plugin.
  *
- * It owns durable side-chat records, the frozen parent-context snapshot, the
- * model turns, and the authenticated Fetch/SSE surface the browser half talks
- * to. The parent Session is never appended to or otherwise mutated here.
+ * A side chat is an ephemeral fork of the parent Session with a live Agent, so
+ * the native Conversation in the sidebar gets the same files, tools, skills,
+ * model API, reasoning effort and permission presets as the main chat.
  */
 import os from 'node:os'
 import path from 'node:path'
-import { SideChatService } from './lib/service.js'
-import { SideChatStore } from './lib/store.js'
+import { rm, stat, rmdir } from 'node:fs/promises'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { NativeSideChatManager } from './lib/manager.js'
+import { EphemeralRegistry } from './lib/registry.js'
 import { createSideChatFetchRoutes } from './lib/http.js'
-import { heuristicTokens } from './lib/core.js'
 
-/** Host plugin name shown by the Loader. */
 export const name = 'side-chat'
 
-/** Services required before the plugin can answer requests. */
-export const inject = ['sessions', 'llm', 'connection']
+export const inject = ['sessions', 'agents', 'connection', 'sessionPersistence', 'sessionQuery']
 
 function storageDirectory() {
   const home = process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh')
@@ -25,47 +25,86 @@ function storageDirectory() {
 }
 
 /**
+ * Resolve a package shipped with this DSH installation from the CLI anchor.
+ * A profile-linked bundle does not inherit the installation's node_modules, so
+ * bare imports of shipped packages are resolved through DSH_INSTALL_DIR.
+ */
+function installRequire() {
+  const installDir = process.env.DSH_INSTALL_DIR
+    ?? path.join(path.dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh')
+  return createRequire(path.join(installDir, 'package.json'))
+}
+
+function loadForkSeed() {
+  const requireFromInstall = installRequire()
+  const resolved = requireFromInstall.resolve('@deepseek-ai/dsh-session/fork')
+  return import(pathToFileURL(resolved).href).then(module => module.buildForkSeed)
+}
+
+/**
  * Plugin entry.
  * @param {import('@deepseek-ai/cordis').Context} ctx - Host context.
  */
 export function apply(ctx) {
-  const store = new SideChatStore({ dir: storageDirectory() })
-  const tokenMeter = ctx.get('tokenMeter')
-  const service = new SideChatService({
-    store,
+  const registry = new EphemeralRegistry({ dir: storageDirectory() })
+  const forkSeed = loadForkSeed().catch((error) => {
+    console.error('[side-chat] cannot load the session fork builder', error)
+    return undefined
+  })
+  const permissionPresets = ctx.get('permissionPresets')
+  const agentPresets = ctx.get('agentPresets')
+  const defaultModel = ctx.get('agentDefaultModel')
+
+  const manager = new NativeSideChatManager({
+    registry,
+    createAgent: options => ctx.agents.create(options),
     getSession: id => ctx.sessions.get(id),
-    stream: options => ctx.llm.stream(options),
-    selection: () => ctx.get('agentDefaultModel')?.currentSelection(),
-    estimate: row => {
-      if (tokenMeter === undefined) return heuristicTokens(row.text)
+    getAgent: id => ctx.agents.get(id),
+    statSession: id => ctx.sessionPersistence.stat(id),
+    readSessionLog: id => ctx.sessionQuery.readSession(id),
+    removePath: async (target) => {
+      let info
       try {
-        return tokenMeter.estimateMessage({
-          id: row.id,
-          role: row.role,
-          content: [{ type: 'text', text: row.text }],
-          source: row.role === 'user'
-            ? { kind: 'user' }
-            : { kind: 'model', provider: 'side-chat', model: 'side-chat' },
-        })
+        info = await stat(target)
       } catch {
-        return heuristicTokens(row.text)
+        return
+      }
+      await rm(target, { recursive: true, force: true })
+      if (info.isFile()) {
+        // The JSONL backend stores one session in its own directory. Remove the
+        // now-empty session directory so a closed side chat leaves no shell.
+        try {
+          await rmdir(path.dirname(target))
+        } catch {
+          // A shared or non-empty directory is left untouched.
+        }
       }
     },
-    maxSnapshotTokens: 8_000,
+    buildSeed: async (events, boundary) => {
+      const buildForkSeed = await forkSeed
+      if (buildForkSeed === undefined) throw new Error('the session fork builder is unavailable')
+      return buildForkSeed(events, boundary)
+    },
+    defaultSelection: () => defaultModel?.currentSelection(),
+    permissionCurrent: session => permissionPresets?.current(session),
+    permissionSet: (session, preset) => permissionPresets?.set(session, preset),
+    agentPreset: session => agentPresets?.presetForSession(session),
+    logger: (message, error) => console.error(`[side-chat] ${message}`, error),
   })
 
-  // The route handlers await service readiness themselves, so a request that
-  // arrives before the store has loaded still settles on the same promise.
-  const routes = createSideChatFetchRoutes({ service })
+  const ready = manager.ready()
+    .then(() => manager.purgeStale())
+    .catch(error => {
+      console.error('[side-chat] startup cleanup failed', error)
+    })
+
+  const routes = createSideChatFetchRoutes({ manager })
   ctx.effect(() => {
     const disposers = []
     for (const route of routes) {
       try {
         disposers.push(ctx.connection.fetch.register(route))
       } catch (error) {
-        // A duplicate path means an earlier activation of this same plugin is
-        // still mounted (for example during a live reload). Keep the remaining
-        // routes and report the collision instead of failing the whole plugin.
         console.error(`[side-chat] route ${route.path} was not registered`, error)
       }
     }
@@ -75,6 +114,8 @@ export function apply(ctx) {
   }, 'side-chat: fetch routes')
 
   ctx.effect(() => () => {
-    for (const controller of service.streams.values()) controller.abort()
-  }, 'side-chat: abort streams on unload')
+    // Best-effort exit cleanup. A hard kill leaves registry rows for the next
+    // startup purge; conversation text lives only in the deleted Session logs.
+    void ready.then(() => manager.disposeAll())
+  }, 'side-chat: purge on unload')
 }

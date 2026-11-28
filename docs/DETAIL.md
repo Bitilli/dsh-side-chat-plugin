@@ -1,105 +1,113 @@
 # Side chat
 
-Select rendered transcript text, then either continue the main conversation with a
-removable quote block or open an independent **side chat** in the right sidebar.
+Side chats are **ephemeral native forks**. They exist to ask a follow-up about a
+selected passage without leaving the main conversation, while still seeing the
+parent’s workspace, tools, files and permissions.
 
-## What it does
+## What happens when you choose “Ask in side”
 
-- **Selection bar** — a compact floating toolbar appears above or below the
-  selection without covering it. It offers:
-  - **在主对话继续问 / Continue in main** — inserts a removable quote block into
-    the current composer. The question is sent in the original conversation.
-  - **在侧边问 / Ask in side** — creates a new side chat and opens it in the
-    right sidebar. The parent conversation is not modified.
-- **Frozen context** — the side chat stores `parentConversationId`,
-  `anchorMessageId`, `quoteRef` and `contextSnapshotId`. The request contains:
-  the frozen parent snapshot up to the anchor + the exact excerpt + the side
-  chat's own messages + the current question.
-- **Independent by default** — later parent messages never enter an existing side
-  chat, and side answers never enter the parent. The explicit **带回主对话 /
-  Bring back to main** action inserts an answer into the parent composer.
-- **Full side-chat lifecycle** — streaming answers, stop, retry, close and
-  reopen. Closing the panel only closes the view; the record and history stay
-  persisted under the DSH home directory.
-- **Multiple side chats** — one side chat is shown at a time; a selector switches
-  between them. Each has its own snapshot and quote.
+1. The Client maps the selection to a rendered source, an exact string, a
+   prefix/suffix window, offsets and the rendered block key.
+2. The Host resolves the selected message to its **surface event seq**, reads the
+   parent log through `sessionQuery.readSession`, and builds a fork seed with
+   `buildForkSeed(events, boundary)`. This copies the parent prefix through the
+   anchor, not the whole conversation and not another project’s chats.
+3. The Host creates a real Session/Agent with that seed and the parent’s `cwd`,
+   `agentPreset` and live model selection. During Agent setup,
+   `agentPresets.composeFrom(childCtx, parentAgent.ctx)` composes the parent’s
+   tools, prompt sections and Skills onto the child.
+4. The Host appends one user-role boundary message containing the parent label,
+   anchor message id, exact excerpt and surrounding context. The model sees it;
+   the side transcript shows it.
+5. The parent’s permission preset is applied to the child. The native composer
+   therefore starts with the same model API / `max` / `high` / permission preset
+   as the main conversation and can be changed there.
+6. A right-Sidebar tab opens a `dsh-resource://sidechat/session/<child>` resource.
+   The tab body wraps the shared embedded Conversation in a `SessionProvider`, so
+   the UI is the product’s own chat UI, not a copy.
 
-## Install and reload
+## Selection bar
 
-Install this directory from **Plugins → Add plugin** (or `plugin_manager`
-`install_bundle` with the absolute path). In the packaged Desktop app the Host
-half starts immediately; the browser half enters the boot graph on the next page
-load, so reload the page once after installation. In a Web profile with the
-client watcher running, the entry reloads without a refresh.
+- Main transcript: **在主对话继续问** inserts a removable quote block into the
+  current composer; **在侧边问** creates the native side chat.
+- Side transcript: only **引用并追问** is shown. It quotes the selection into the
+  side chat’s own composer; it never nests another side chat.
+- The bar appears only for one non-collapsed selection inside a rendered message
+  source. Selections shorter than two effective characters, across two messages,
+  or inside the composer/buttons/menus are ignored.
+- `Alt+Q` activates the primary action, `Alt+S` asks in side from the main chat,
+  `Esc` dismisses. The bar is positioned above/below the selection and keeps the
+  selection alive on pointer-down.
+- While the bar is open, the shipped quote pill is hidden by a scoped `body`
+  attribute; the primary action uses the same `inputActions.insertQuote` path.
 
-## Selection rules
+## Inheritance and tools
 
-The bar only appears for a non-collapsed selection inside one rendered message
-body (`[data-text-interaction-source]`). Selections shorter than two effective
-characters, selections spanning two messages, and selections inside the
-composer, buttons, menus or the side panel are ignored. The quote records the
-exact text, a prefix/suffix window, best-effort character offsets, and the
-rendered node key. Keyboard: `Alt+Q` continues in main, `Alt+S` asks in side,
-`Escape` dismisses. On touch devices the native long-press selection raises the
-same bar.
+| Capability | How the side chat gets it |
+| --- | --- |
+| Parent history to the anchor | `buildForkSeed` inclusive prefix + synthetic fork closers |
+| Workspace / files | `meta.cwd` from the parent Session header |
+| Agent preset / tools / Skills | `agentPresets.composeFrom(childCtx, parent.ctx)` during setup |
+| Model API / `max` / `high` | parent `agent.model.current()`, recorded on the child with `model.select()` |
+| Permission preset | parent `permissionPresets.current()`, applied with `set()` |
+| Selection source | injected boundary message with anchor id and exact/prefix/suffix |
 
-## Storage and privacy
+The side chat is an ordinary Session (not a `subagent`), so the Session Controller
+can prompt it normally. It is created without a workspace attachment, so it does
+not add a row to the workspace conversation list.
 
-Records live in `DSH_HOME/side-chat/<profile>/side-chats.json` as an atomic JSON
-document. They contain the quote, the frozen parent transcript up to the anchor,
-and the side-chat messages. Nothing is sent anywhere except the configured model
-provider when a turn runs. The browser surface is registered on the Host
-connection's authenticated `/api` channel, so an unauthenticated request is
-rejected with 401 before it reaches the service; the deployment has one owner
-principal. A side chat is always addressed together with its `parentSessionId`;
-a mismatch returns 404 and leaks no content.
+## Ephemeral cleanup
+
+The plugin keeps only identities in `DSH_HOME/side-chat/<profile>/ephemeral.json`;
+conversation text lives in the Session log and nowhere else.
+
+- **Closing the side panel** (collapsing the right sidebar) purges every side chat
+  for that parent: dispose the Agent handle, delete the Session log, remove its
+  now-empty session directory, clear the registry row, and close the side tabs.
+- **Closing one of several tabs** deletes only that side chat. Closing the last
+  tab closes the panel path and purges the parent scope.
+- **Host/plugin unload** disposes every live handle and deletes its log; a hard
+  kill leaves registry rows that `purgeStale()` removes on the next startup.
+- A restored tab whose Session was purged has no resource and closes itself.
+
+DSH has no public `session.delete` or search-index purge. This is therefore a
+**best-effort** purge: session logs and registry entries are removed, but the
+Session search index may retain derived text until its own rebuild.
+
+## Permissions and Auto review
+
+The side chat runs under the selected permission preset, including **自动审查**
+when that preset is configured and its reviewer credential is available. Auto
+review is a deployment feature: in this environment the reviewer route
+(`deepseek-official`) reported `MISSING_CREDENTIAL`, so tool calls under Auto
+failed until the preset was switched to **工作区内修改**. The side chat does not
+invent a second permission system; it reports the product’s own failure.
 
 ## Known limits
 
-- **Main-chat provenance is textual.** The core message format has no structured
-  `quoteRefs` field for ordinary turns, so the main-chat path persists its source
-  as a quoted `引用自当前对话` line and as the composer's quote summary. The side
-  chat stores the full structured quote ref.
-- **Anchor fallback is best-effort.** If the anchor message was edited, deleted or
-  re-rendered, the saved excerpt is matched by exact text, then by prefix/suffix,
-  then by a fragment; if none match, the snapshot ends at the newest message and
-  records `anchorMatch: "none"`.
-- **Context budgeting is a tail budget.** The snapshot uses the Host token meter
-  for per-message estimates and keeps the newest rows within the configured
-  budget; it records the truncation strategy instead of invoking the compaction
-  service (which requires a Session that this side chat deliberately does not
-  own).
-- **Text-only context.** Parent tool results, images and attachments are not
-  copied into the snapshot; only user/assistant text is.
-- **No automatic sync.** There is intentionally no live link between the parent
-  and a side chat after creation.
-- **Side chats are plugin-owned records.** They are not Session-log entries, so
-  Session search, Session export and the Session list do not include them. This
-  is what keeps them out of the parent and out of the model-visible history; the
-  trade-off is that the DSH Session tooling cannot inspect them.
-- **The shipped quote pill is hidden while the selection bar is open.** A scoped
-  `body` attribute hides the built-in text-interaction surface only while this
-  bar is visible; **Continue in main** calls the same `inputActions.insertQuote`
-  path, and removing/unloading the plugin clears the attribute. If the shipped
-  quote plugin changes its surface attribute, re-check this coexistence.
-- **Host reload.** A stream interrupted by a Host restart is marked as an error so
-  the user can retry; it is not resumed mid-answer.
+- **Fork, not a summary.** The child inherits the full parent prefix through the
+  anchor. It does not include later parent messages and does not sync afterward.
+- **No native session deletion.** Cleanup is plugin-side and best-effort; the
+  search index may retain derived text.
+- **Boundary quote is a user message.** The excerpt is visible in the side
+  transcript and the model sees it. It is not hidden metadata.
+- **Side chats are not in the workspace list.** They are real Sessions with no
+  workspace attachment; they are reachable only through the side tab while open.
+- **Parent history prefix can be large.** The child inherits the parent prefix;
+  token pressure follows the normal Session/compaction behavior.
+- **Auto review credentials.** If the deployment’s reviewer credential is
+  missing, use another permission preset; the option itself remains selectable.
 
 ## HTTP surface
 
-All routes are exact paths on the Host connection's shared `/api` channel, so
-they share its authentication and trust checks.
+All routes are exact paths on the Host connection’s authenticated `/api` channel.
 
 | Route | Purpose |
 | --- | --- |
-| `POST /api/side-chat/create` | Freeze the snapshot and create a side chat |
-| `GET /api/side-chat/list?parentSessionId=` | Side chats for one parent |
-| `GET /api/side-chat/get?id=&parentSessionId=` | One side chat |
-| `POST /api/side-chat/turn` | Append a question and stream the answer (SSE) |
-| `POST /api/side-chat/cancel` | Abort the active answer without deleting it |
-| `POST /api/side-chat/retry` | Remove the failed/cancelled answer and re-run without duplicating the question |
-| `POST /api/side-chat/delete` | Delete one side chat |
+| `POST /api/side-chat/create` | Resolve the anchor, fork the Session, inject the quote, return the resource address |
+| `GET /api/side-chat/list?parentSessionId=` | Registry rows for one parent |
+| `POST /api/side-chat/delete` | Purge one side chat |
+| `POST /api/side-chat/purge` | Purge every side chat for one parent |
 
-Streaming uses the existing model stream and ordinary SSE framing with
-`start`, `delta`, `reasoning`, `done` and `error` frames. It does not introduce a
-second message protocol.
+Message turns are **not** sent to these routes: the native Conversation prompts
+the forked Session through the existing Session Controller and streaming path.

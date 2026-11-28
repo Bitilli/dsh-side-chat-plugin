@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  buildRequestMessages, buildSystemPrompt, deriveParentTitle, freezeSnapshot,
-  heuristicTokens, locateAnchor, normalizeText, parentMessages, publicChat,
+  deriveParentTitle, locateAnchor, normalizeText, parentMessages, parseSideChatAddress,
+  quoteMessage, resolveAnchor, sideChatAddress, titleFromQuote,
 } from '../lib/core.js'
 
 function message(id, role, text) {
@@ -11,111 +11,73 @@ function message(id, role, text) {
 
 function session(rows) {
   const messages = rows.map(row => message(row.id, row.role, row.text))
+  const seqOf = new Map(rows.map(row => [row.id, row.seq]))
   return {
     id: 's1',
+    header: { cwd: 'D:/work' },
     deriveMessages: () => messages,
-    surface: { nodes: [] },
-    eventAt: () => undefined,
+    surface: { nodes: rows.map(row => row.seq) },
+    eventAt: seq => {
+      const row = rows.find(candidate => candidate.seq === seq)
+      if (row === undefined) return undefined
+      return row.role === 'user'
+        ? { type: 'user/message', data: { id: row.id } }
+        : { type: 'assistant/message', data: { message: { id: row.id } } }
+    },
   }
 }
 
 const rows = [
-  { id: 'm1', role: 'user', text: 'first question about alpha' },
-  { id: 'm2', role: 'assistant', text: 'first answer about alpha' },
-  { id: 'm3', role: 'user', text: 'later question about beta' },
-  { id: 'm4', role: 'assistant', text: 'later answer about beta' },
+  { id: 'm1', role: 'user', text: 'first question about alpha', seq: 3 },
+  { id: 'm2', role: 'assistant', text: 'first answer about alpha', seq: 8 },
+  { id: 'm3', role: 'user', text: 'later question about beta', seq: 12 },
+  { id: 'm4', role: 'assistant', text: 'later answer about beta', seq: 18 },
 ]
 
-test('parentMessages keeps only user and assistant text in order', () => {
+test('parent messages keep surface seqs and text', () => {
   const result = parentMessages(session(rows))
-  assert.deepEqual(result.map(row => row.id), ['m1', 'm2', 'm3', 'm4'])
+  assert.deepEqual(result.map(row => [row.id, row.seq]), [['m1', 3], ['m2', 8], ['m3', 12], ['m4', 18]])
   assert.equal(result[1].text, 'first answer about alpha')
 })
 
-test('locateAnchor prefers the explicit message id', () => {
-  const located = locateAnchor(rows, { messageId: 'm2', exact: 'alpha' })
-  assert.equal(located.index, 1)
-  assert.equal(located.match, 'id')
+test('anchor prefers the explicit message id, then exact text, then affixes', () => {
+  assert.equal(locateAnchor(rows, { messageId: 'm2', exact: 'alpha' }).match, 'id')
+  assert.equal(locateAnchor(rows, { messageId: 'gone', exact: 'first answer about alpha' }).index, 1)
+  assert.equal(locateAnchor(rows, { exact: 'gone', prefix: 'first answer', suffix: 'alpha' }).index, 1)
+  assert.equal(locateAnchor(rows, { exact: 'gone' }).match, 'none')
 })
 
-test('locateAnchor falls back to exact text when the id is stale', () => {
-  const located = locateAnchor(rows, { messageId: 'm-deleted', exact: 'first answer about alpha' })
-  assert.equal(located.index, 1)
-  assert.equal(located.match, 'exact')
+test('resolveAnchor returns the surface seq used as the fork boundary', () => {
+  assert.deepEqual(resolveAnchor(session(rows), { exact: 'first answer about alpha' }), {
+    boundary: 8, anchorMessageId: 'm2', match: 'exact',
+  })
+  assert.deepEqual(resolveAnchor(session(rows), { exact: 'gone' }), {
+    boundary: 18, anchorMessageId: 'm4', match: 'none',
+  })
+  assert.deepEqual(resolveAnchor({ surface: { nodes: [] }, deriveMessages: () => [], eventAt: () => undefined }, {}), {
+    boundary: -1, anchorMessageId: '', match: 'none',
+  })
 })
 
-test('locateAnchor uses prefix and suffix when only those survive', () => {
-  const located = locateAnchor(rows, { messageId: 'm-deleted', exact: 'not present', prefix: 'first answer', suffix: 'alpha' })
-  assert.equal(located.index, 1)
-  assert.equal(located.match, 'affix')
-})
-
-test('locateAnchor degrades to the newest message instead of failing', () => {
-  const located = locateAnchor(rows, { messageId: 'm-deleted', exact: 'text that is gone' })
-  assert.equal(located.index, rows.length - 1)
-  assert.equal(located.match, 'none')
-})
-
-test('freezeSnapshot stops at the anchor and trims from the front', () => {
-  const frozen = freezeSnapshot(rows, 2, { maxTokens: 8, estimate: row => Math.ceil(row.text.length / 2) })
-  assert.equal(frozen.messages.at(-1).id, 'm3')
-  assert.equal(frozen.messages.some(row => row.id === 'm4'), false)
-  assert.ok(frozen.truncatedCount > 0)
-  assert.equal(frozen.excludedAfterAnchor, 1)
-})
-
-test('freezeSnapshot always keeps the anchor even over budget', () => {
-  const frozen = freezeSnapshot(rows, 1, { maxTokens: 1, estimate: () => 100 })
-  assert.deepEqual(frozen.messages.map(row => row.id), ['m2'])
-  assert.equal(frozen.estimatedTokens, 100)
-})
-
-test('buildSystemPrompt freezes the snapshot and quote', () => {
-  const chat = {
-    parentTitle: 'Alpha',
-    parentSessionId: 's1',
-    anchorMessageId: 'm2',
-    anchorSeq: 12,
-    quoteRef: { exact: 'first answer about alpha' },
-    contextSnapshot: {
-      capturedAt: '2026-01-01T00:00:00.000Z',
-      estimatedTokens: 42,
-      truncatedCount: 1,
-      strategy: 'tail-budget',
-      messages: [{ role: 'user', text: 'first question about alpha' }],
-    },
-  }
-  const prompt = buildSystemPrompt(chat)
-  assert.match(prompt, /first answer about alpha/u)
-  assert.match(prompt, /read-only snapshot/u)
-  assert.match(prompt, /truncated 1 earlier messages|1 earlier messages omitted/u)
-  assert.match(prompt, /Anchor message: m2 at seq 12/u)
-})
-
-test('buildRequestMessages excludes failed assistants and keeps user text', () => {
-  const chat = {
-    messages: [
-      { id: 'u1', role: 'user', content: [{ type: 'text', text: 'q1' }], status: 'done' },
-      { id: 'a1', role: 'assistant', content: [{ type: 'text', text: 'bad' }], status: 'error' },
-      { id: 'a2', role: 'assistant', content: [{ type: 'text', text: 'good' }], status: 'done' },
-    ],
-  }
-  const messages = buildRequestMessages(chat, { provider: 'p', model: 'm' })
-  assert.equal(messages.length, 2)
-  assert.equal(messages[0].role, 'user')
-  assert.equal(messages[1].content[0].text, 'good')
-  assert.deepEqual(messages[1].source, { kind: 'model', provider: 'p', model: 'm' })
-})
-
-test('titles and helpers stay deterministic', () => {
-  assert.equal(normalizeText('  a\n b  '), 'a b')
+test('titles and quote messages are derived from the selection', () => {
   assert.equal(deriveParentTitle(rows), 'first question about alpha')
-  assert.equal(heuristicTokens('abcd'), 1)
-  assert.equal(heuristicTokens('abcde'), 2)
-  const chat = {
-    id: 's', kind: 'side', parentSessionId: 's1', parentTitle: 't', anchorMessageId: '', anchorSeq: null,
-    contextSnapshotId: 'c', title: 't', status: 'idle', createdAt: 'x', updatedAt: 'x', quoteRef: { exact: 'e' },
-    contextSnapshot: { messages: [] }, messages: [],
-  }
-  assert.equal(publicChat(chat).id, 's')
+  assert.match(titleFromQuote({ exact: 'alpha answer' }), /^侧聊 · alpha answer$/u)
+  const text = quoteMessage({
+    parentTitle: 'Alpha', anchorMessageId: 'm2', exact: 'alpha answer', prefix: 'first ', suffix: ' about alpha',
+  })
+  assert.match(text, /父对话：Alpha/u)
+  assert.match(text, /锚点消息：m2/u)
+  assert.match(text, /alpha answer/u)
+  assert.match(text, /请围绕这段引用/u)
+})
+
+test('side-chat resource addresses round-trip', () => {
+  const address = sideChatAddress({ childSessionId: 'side-1', parentSessionId: 's1', title: '侧聊 · quote' })
+  assert.match(address, /^dsh-resource:\/\/sidechat\/session\//u)
+  assert.deepEqual(parseSideChatAddress(address), {
+    childSessionId: 'side-1', parentSessionId: 's1', title: '侧聊 · quote',
+  })
+  assert.equal(parseSideChatAddress('dsh-resource://subagentchat/session/x?parent=s1&mode=continuable'), undefined)
+  assert.equal(parseSideChatAddress('nope'), undefined)
+  assert.equal(normalizeText(' a\n b '), 'a b')
 })

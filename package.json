@@ -2,7 +2,7 @@
   "name": "dsh-side-chat-plugin",
   "version": "0.1.0",
   "private": true,
-  "description": "Selection quotes and side chats for DeepSeek Harness",
+  "description": "Ephemeral native side chats with selection quotes for DeepSeek Harness",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Bitilli/dsh-side-chat-plugin.git"

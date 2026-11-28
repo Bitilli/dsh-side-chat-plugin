@@ -1,7 +1,7 @@
 {
   "meta": {
     "title": "Side chat",
-    "description": "Select transcript text to ask a follow-up in the main conversation or open an isolated side chat with a frozen parent-context snapshot and the exact quote.",
+    "description": "Open an ephemeral native side chat from selected transcript text. It inherits the parent workspace, tools, model API, reasoning effort and permission presets; closing the panel or quitting Harness purges its Session log.",
     "detail": "docs/DETAIL.md"
   }
 }
