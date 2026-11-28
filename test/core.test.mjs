@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  deriveParentTitle, locateAnchor, normalizeText, parentMessages, parseSideChatAddress,
+  deriveParentTitle, locateAnchor, messageIdFromBlock, normalizeText, parentMessages, parseSideChatAddress,
   quoteMessage, resolveAnchor, sideChatAddress, titleFromQuote,
 } from '../lib/core.js'
 
@@ -80,4 +80,12 @@ test('side-chat resource addresses round-trip', () => {
   assert.equal(parseSideChatAddress('dsh-resource://subagentchat/session/x?parent=s1&mode=continuable'), undefined)
   assert.equal(parseSideChatAddress('nope'), undefined)
   assert.equal(normalizeText(' a\n b '), 'a b')
+})
+
+test('a rendered node key can supply the anchor message id', () => {
+  assert.equal(
+    messageIdFromBlock('13:input-messagebd525178-0a7e-47fe-a7e0-0787b36d1ed0'),
+    'bd525178-0a7e-47fe-a7e0-0787b36d1ed0',
+  )
+  assert.equal(messageIdFromBlock('assistant-nothing'), undefined)
 })
